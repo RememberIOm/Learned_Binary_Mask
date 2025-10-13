@@ -1,0 +1,19 @@
+# Core ML stack
+torch
+torchvision
+
+# Hugging Face ecosystem
+transformers
+datasets
+huggingface_hub
+
+# Training & evaluation utilities
+scikit-learn
+tqdm
+numpy
+
+# Visualization
+matplotlib
+
+# Optional logging
+wandb
