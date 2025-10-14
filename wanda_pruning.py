@@ -57,15 +57,15 @@ def _collect_act_norms(
     model.eval()
     model.to(device)
 
-    for batch in calib_dl:
-        try:
-            if "pixel_values" in batch:
-                model(pixel_values=batch["pixel_values"].to(device))
-            else:
-                model(**{k: v.to(device) for k, v in batch.items() if k != "labels"})
-        except Exception:
-            # When pruning sequentially, some layers may be temporarily incompatible; skip safely.
-            pass
+    with torch.no_grad():
+        for batch in calib_dl:
+            try:
+                inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
+                # Support both tokens and precomputed inputs_embeds (NLP), and pixel_values (Vision)
+                model(**inputs) if inputs else None
+            except Exception:
+                # When pruning sequentially, some layers may be temporarily incompatible; skip safely.
+                continue
 
     handle.remove()
     if sum_sq is None:

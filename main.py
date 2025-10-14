@@ -43,7 +43,8 @@ from learned_binary_mask_pruning import (
     train_with_progressive_pruning,
 )
 from wanda_pruning import wanda_prune
-from decomposition import decompose_to_two_classifiers
+from decomposition import decompose_to_target_vs_rest
+from adv_utils import map_target_vs_rest
 
 # ------------------------- Optional logging -------------------------
 try:
@@ -82,7 +83,7 @@ class ExpConfig:
     nm_values: Optional[Tuple[int, int]] = None  # e.g., (2,4) for N:M
 
     # In-training LB-Mask options
-    prune_during_train: bool = False  # True => progressive pruning during training
+    prune_during_train: bool = True  # True => progressive pruning during training
     prune_schedule: str = "constant"  # constant | linear | cosine
     prune_start_sparsity: float = 0.0
     prune_end_sparsity: float = 0.5
@@ -90,7 +91,7 @@ class ExpConfig:
     prune_end_step: Optional[int] = None  # if None, will be total_steps
     prune_update_every: int = 100
     hard_apply: bool = False  # permanently zero weights during training
-    freeze_base: bool = False  # jointly train base weights when True->False
+    freeze_base: bool = True  # jointly train base weights when True->False
 
     # Calibration (Wanda)
     calib_nlp: int = 512
@@ -399,20 +400,39 @@ def evaluate(
             labels.extend(y.cpu().numpy())
         else:
             # Map GT labels to {0:target, 1:negative} to match TwoHeadLinear order.
-            y_bin = (y != binary_target_idx).long()  # 0=target, 1=negative
+            y_bin = map_target_vs_rest(y, int(binary_target_idx))
             preds.extend(pred.cpu().numpy())  # 0=target, 1=negative
             labels.extend(y_bin.cpu().numpy())
 
     if binary_target_idx is None:
-        names = class_names_for(cfg.dataset_name)
+        labels_param = list(range(cfg.num_labels))  # e.g., [0,1,2,3]
+        names = class_names_for(cfg.dataset_name) or [str(i) for i in labels_param]
     else:
+        labels_param = [0, 1]  # 0=target, 1=negative
         names = ["target", "negative"]
 
+    # classification_report with fixed labels and safe zero_division
     rep_dict = classification_report(
-        labels, preds, target_names=names, output_dict=True, digits=4
+        labels,
+        preds,
+        labels=labels_param,
+        target_names=names,
+        output_dict=True,
+        digits=4,
+        zero_division=0,  # avoid warnings/errors for support=0
     )
+
     print("\n--- Classification Report ---")
-    print(classification_report(labels, preds, target_names=names, digits=4))
+    print(
+        classification_report(
+            labels,
+            preds,
+            labels=labels_param,
+            target_names=names,
+            digits=4,
+            zero_division=0,
+        )
+    )
     print("-----------------------------\n")
     return rep_dict["accuracy"], rep_dict
 
@@ -498,7 +518,7 @@ def run_experiment(cfg: ExpConfig):
             wandb.finish()
 
         if cfg.apply_decomposition:
-            decomposed = decompose_to_two_classifiers(pruned, cfg.target_class).to(
+            decomposed = decompose_to_target_vs_rest(pruned, cfg.target_class).to(
                 device
             )
             acc_bin, _ = evaluate(
@@ -509,104 +529,60 @@ def run_experiment(cfg: ExpConfig):
             )
 
     elif cfg.prune_method == "lbmask":
-        # If user requests pruning during training, run progressive path.
-        if cfg.prune_during_train:
-            mp_cfg = MaskPruneConfig(
-                granularity="out",
-                # Mask learning hyperparams
-                lr=5e-3,
-                lmbda_l1=1e-3,
-                num_epochs=cfg.num_epochs,
-                skip_final_classifier=True,
-                # Progressive schedule
-                freeze_base=cfg.freeze_base,
-                prune_during_train=True,
-                schedule=cfg.prune_schedule,  # "constant" | "linear" | "cosine"
-                start_sparsity=cfg.prune_start_sparsity,
-                end_sparsity=cfg.prune_end_sparsity,
-                begin_step=cfg.prune_begin_step,
-                end_step=(
-                    cfg.prune_end_step
-                    if cfg.prune_end_step is not None
-                    else (cfg.num_epochs * len(train_dl))
-                ),
-                update_every=cfg.prune_update_every,
-                hard_apply=cfg.hard_apply,
-                zero_bias_when_masked=True,
+        mp_cfg = MaskPruneConfig(
+            granularity="out",
+            # Mask learning hyperparams
+            lr=5e-3,
+            lmbda_l1=1e-3,
+            num_epochs=cfg.num_epochs,
+            skip_final_classifier=True,
+            # Progressive schedule
+            freeze_base=cfg.freeze_base,
+            prune_during_train=True,
+            schedule=cfg.prune_schedule,  # "constant" | "linear" | "cosine"
+            start_sparsity=cfg.prune_start_sparsity,
+            end_sparsity=cfg.prune_end_sparsity,
+            begin_step=cfg.prune_begin_step,
+            end_step=(
+                cfg.prune_end_step
+                if cfg.prune_end_step is not None
+                else (cfg.num_epochs * len(train_dl))
+            ),
+            update_every=cfg.prune_update_every,
+            hard_apply=cfg.hard_apply,
+            zero_bias_when_masked=True,
+        )
+
+        masked_model, overlays = train_with_progressive_pruning(
+            base_model=model,
+            train_dl=train_dl,
+            mp_cfg=mp_cfg,
+            base_lr=cfg.lr,
+            num_epochs=cfg.num_epochs,
+            device=device,
+        )
+
+        # Export a clean pruned copy (no wrappers) using the last thresholds
+        pruned_model = export_pruned_copy(model, overlays).to(device)
+        overall_sparsity, _ = calc_sparsity(pruned_model)
+        acc1, _ = evaluate(pruned_model, test_dl, cfg, device)
+
+        print(f"[progressive] Acc={acc1:.4f} | Sparsity={overall_sparsity:.2f}%")
+
+        if cfg.use_wandb and _WANDB_AVAILABLE:
+            wandb.log({"pruned_accuracy": acc1, "pruned_sparsity": overall_sparsity})
+            wandb.finish()
+
+        if cfg.apply_decomposition:
+            decomposed = decompose_to_target_vs_rest(pruned_model, cfg.target_class).to(
+                device
             )
-
-            masked_model, overlays = train_with_progressive_pruning(
-                base_model=model,
-                train_dl=train_dl,
-                mp_cfg=mp_cfg,
-                base_lr=cfg.lr,
-                num_epochs=cfg.num_epochs,
-                device=device,
+            acc_bin, _ = evaluate(
+                decomposed, test_dl, cfg, device, binary_target_idx=cfg.target_class
             )
-
-            # Export a clean pruned copy (no wrappers) using the last thresholds
-            pruned_model = export_pruned_copy(model, overlays).to(device)
-            overall_sparsity, _ = calc_sparsity(pruned_model)
-            acc1, _ = evaluate(pruned_model, test_dl, cfg, device)
-
-            print(f"[progressive] Acc={acc1:.4f} | Sparsity={overall_sparsity:.2f}%")
-
-            if cfg.use_wandb and _WANDB_AVAILABLE:
-                wandb.log(
-                    {"pruned_accuracy": acc1, "pruned_sparsity": overall_sparsity}
-                )
-                wandb.finish()
-
-            if cfg.apply_decomposition:
-                decomposed = decompose_to_two_classifiers(
-                    pruned_model, cfg.target_class
-                ).to(device)
-                acc_bin, _ = evaluate(
-                    decomposed, test_dl, cfg, device, binary_target_idx=cfg.target_class
-                )
-                print(
-                    f"[decomp] Binary accuracy (target={cfg.target_class}): {acc_bin:.4f}"
-                )
-
-        else:
-            mp_cfg = MaskPruneConfig(
-                granularity="out",
-                target_sparsity=cfg.sparsity_ratio,
-                lr=5e-3,
-                lmbda_l1=1e-3,
-                num_epochs=3,
-                skip_final_classifier=True,
-            )
-            masked_model, overlays = build_masked_model_from(
-                model, mp_cfg, device=device
-            )
-            train_masks(masked_model, train_dl, mp_cfg, device)
-            thr, s_ratio = project_by_line_search(
-                masked_model=masked_model,
-                base_model=model,
-                overlays=overlays,
-                target_sparsity=mp_cfg.target_sparsity,
-                tol=1e-3,
-                max_iter=25,
-                verbose=True,
-            )
-            pruned_model = export_pruned_copy(model, overlays).to(device)
-            overall_sparsity, _ = calc_sparsity(pruned_model)
-            acc1, _ = evaluate(pruned_model, test_dl, cfg, device)
             print(
-                f"Base acc={acc0:.4f} | Pruned acc={acc1:.4f} | Sparsity={overall_sparsity:.2f}%"
+                f"[decomp] Binary accuracy (target={cfg.target_class}): {acc_bin:.4f}"
             )
-
-            if cfg.apply_decomposition:
-                decomposed = decompose_to_two_classifiers(
-                    pruned_model, cfg.target_class
-                ).to(device)
-                acc_bin, _ = evaluate(
-                    decomposed, test_dl, cfg, device, binary_target_idx=cfg.target_class
-                )
-                print(
-                    f"[decomp] Binary accuracy (target={cfg.target_class}): {acc_bin:.4f}"
-                )
     else:
         raise ValueError(f"Unknown prune_method: {cfg.prune_method}")
 
@@ -700,7 +676,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sparsity", type=float, default=0.5, help="target sparsity ratio (e.g., 0.5)"
     )
-    parser.add_argument("--prune_during_train", action="store_true")
     parser.add_argument(
         "--prune_schedule",
         type=str,
@@ -714,12 +689,16 @@ if __name__ == "__main__":
     parser.add_argument("--prune_update_every", type=int, default=100)
     parser.add_argument("--hard_apply", action="store_true")
     parser.add_argument(
-        "--freeze_base", action="store_true"
-    )  # if you prefer frozen base, pass this
-    parser.add_argument("--target_class", type=int, default=0,
-                    help="index of the class to serve as the 'target'")
-    parser.add_argument("--no_decomposition", action="store_true",
-                        help="skip two-head decomposition (keep multiclass head)")
+        "--target_class",
+        type=int,
+        default=0,
+        help="index of the class to serve as the 'target'",
+    )
+    parser.add_argument(
+        "--no_decomposition",
+        action="store_true",
+        help="skip two-head decomposition (keep multiclass head)",
+    )
 
     args = parser.parse_args()
 
@@ -750,9 +729,8 @@ if __name__ == "__main__":
 
     # If --freeze_base is set, we freeze backbone weights during progressive pruning
     cfg.freeze_base = args.freeze_base
-    
+
     cfg.target_class = args.target_class
     cfg.apply_decomposition = not args.no_decomposition
-
 
     run_experiment(cfg)

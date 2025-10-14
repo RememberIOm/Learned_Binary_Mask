@@ -702,19 +702,13 @@ def train_with_progressive_pruning(
     masked_model.train()
 
     # Parameter groups: non-mask (base etc.) and mask logits
-    mask_params, other_params = [], []
     for n, p in masked_model.named_parameters():
-        (mask_params if "mask_logits" in n else other_params).append(p)
+        if "mask_logits" not in n:
+            p.requires_grad_(False)
 
+    mask_params = [p for n, p in masked_model.named_parameters() if "mask_logits" in n]
     opt = torch.optim.AdamW(
-        [
-            {"params": other_params, "lr": base_lr, "weight_decay": 0.01},
-            {
-                "params": mask_params,
-                "lr": mp_cfg.lr,
-                "weight_decay": mp_cfg.weight_decay,
-            },
-        ]
+        [{"params": mask_params, "lr": mp_cfg.lr, "weight_decay": mp_cfg.weight_decay}]
     )
 
     # Simple linear scheduler for total steps (optional)
@@ -777,9 +771,15 @@ def train_with_progressive_pruning(
                 )
 
     pbar.close()
-    if pruner.last_thr is not None:
-        for m in overlays.values():
-            m.binarize(pruner.last_thr)
+    project_by_line_search(
+        masked_model=masked_model,
+        base_model=base_model,
+        overlays=overlays,
+        target_sparsity=mp_cfg.end_sparsity,
+        tol=1e-3,
+        max_iter=25,
+        verbose=False,
+    )
     return masked_model, overlays
 
 

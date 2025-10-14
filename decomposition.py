@@ -18,7 +18,7 @@ import torch.nn as nn
 _FINAL_HEAD_NAMES = ("classifier", "classification_head", "fc")
 
 
-class TwoHeadLinear(nn.Module):
+class TargetVsRestLinear(nn.Module):
     """Two parallel Linear heads producing logits [target, negative]."""
 
     def __init__(self, base_linear: nn.Linear, target_idx: int):
@@ -53,18 +53,24 @@ class TwoHeadLinear(nn.Module):
         return torch.cat([logit_pos, logit_neg], dim=-1)
 
 
-def decompose_to_two_classifiers(model: nn.Module, target_idx: int) -> nn.Module:
+def decompose_to_target_vs_rest(model: nn.Module, target_idx: int) -> nn.Module:
     """
-    Return a prunable copy of the given model whose final Linear head
-    is replaced by TWO binary classifiers (TwoHeadLinear).
+    Return a prunable copy whose final head outputs [target, negative] logits.
+    Also sync HF num_labels to 2 so that loss/reshapes are correct.
     """
     m = copy.deepcopy(model)
-    # Find a plain Linear head by common attribute names
     for name in _FINAL_HEAD_NAMES:
         if hasattr(m, name):
             head = getattr(m, name)
             if isinstance(head, nn.Linear):
-                setattr(m, name, TwoHeadLinear(head, target_idx))
+                setattr(m, name, TargetVsRestLinear(head, target_idx))
+                # --- Ensure HF loss uses correct label dimension (2) ---
+                if hasattr(m, "num_labels"):
+                    m.num_labels = 2
+                if hasattr(m, "config") and hasattr(m.config, "num_labels"):
+                    m.config.num_labels = 2
+                # Optional: stamp target for downstream helpers
+                setattr(m, "_binary_target_idx", int(target_idx))
                 return m
     raise ValueError(
         "Expected a plain nn.Linear final head named one of "

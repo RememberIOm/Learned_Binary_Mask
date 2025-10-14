@@ -56,7 +56,7 @@ from learned_binary_mask_pruning import (
     train_with_progressive_pruning,
 )
 from wanda_pruning import wanda_prune
-from decomposition import decompose_to_two_classifiers  # two-head [target, negative]
+from decomposition import decompose_to_target_vs_rest  # two-head [target, negative]
 
 
 # ------------------------- CSV helpers (FIX) -------------------------
@@ -159,7 +159,7 @@ def run_wanda_once(
 
     if apply_decomposition:
         # Replace final head with [target, negative] on the PRUNED COPY only
-        decomp = decompose_to_two_classifiers(pruned, target_class).to(device)
+        decomp = decompose_to_target_vs_rest(pruned, target_class).to(device)
         acc_bin, _ = evaluate(
             decomp, test_dl, cfg, device, binary_target_idx=target_class
         )  # requires main.py change
@@ -168,102 +168,13 @@ def run_wanda_once(
     return row
 
 
-def run_lbmask_once(
-    model,
-    train_dl,
-    test_dl,
-    cfg: ExpConfig,
-    device: torch.device,
-    sparsity: float,
-    target_class: int,
-    apply_decomposition: bool,
-) -> Dict:
-    """
-    Run LB-Mask pruning at a given sparsity; return metrics.
-    Kept for single-shot runs, but the sweep path now trains once
-    and reuses the same learned overlays for all sparsities.
-    """
-    mp_cfg = MaskPruneConfig(
-        granularity="out",  # per-neuron masks
-        target_sparsity=sparsity,  # drive to target ratio via line-search projection
-        lr=5e-3,
-        lmbda_l1=1e-3,
-        num_epochs=3,
-        skip_final_classifier=True,
-        verbose=True,
-    )
-    masked_model, overlays = build_masked_model_from(model, mp_cfg, device=device)
-    train_masks(masked_model, train_dl, mp_cfg, device)
-
-    # Project via line search to match target sparsity (global threshold)
-    thr, s_ratio = project_by_line_search(
-        masked_model=masked_model,
-        base_model=model,
-        overlays=overlays,
-        target_sparsity=mp_cfg.target_sparsity,
-        tol=1e-3,
-        max_iter=25,
-        verbose=True,
-    )
-
-    pruned_model = export_pruned_copy(model, overlays).to(device)
-    overall_sparsity, _ = calc_sparsity(pruned_model)
-    acc_mc, _ = evaluate(pruned_model, test_dl, cfg, device)
-
-    row = {
-        "method": "lbmask",
-        "target_sparsity": sparsity,
-        "achieved_sparsity": overall_sparsity / 100.0,
-        "accuracy": acc_mc,
-        "threshold": float(thr),
-        "line_search_achieved": float(s_ratio),
-    }
-
-    if apply_decomposition:
-        decomp = decompose_to_two_classifiers(pruned_model, target_class).to(device)
-        acc_bin, _ = evaluate(
-            decomp, test_dl, cfg, device, binary_target_idx=target_class
-        )
-        row.update({"binary_accuracy": acc_bin, "binary_target_class": target_class})
-
-    return row
-
-
-def train_lbmask_overlays_once(
-    model, train_dl, cfg: ExpConfig, device: torch.device, ref_target: float = 0.5
-) -> Tuple[object, dict, MaskPruneConfig]:
-    """
-    Train LB-Mask overlays *once* for this experiment.
-    After this, different sparsity targets can be realized by simply
-    running the line-search projection with different thresholds.
-    - ref_target is only used for logging purposes during mask training.
-    """
-    mp_cfg = MaskPruneConfig(
-        granularity="out",
-        target_sparsity=ref_target,  # training-time hint for logs; not binding
-        lr=5e-3,
-        lmbda_l1=1e-3,
-        num_epochs=3,
-        skip_final_classifier=True,
-        verbose=True,
-    )
-    masked_model, overlays = build_masked_model_from(model, mp_cfg, device=device)
-    # Learn mask logits once (original weights are frozen by construction).
-    train_masks(masked_model, train_dl, mp_cfg, device)
-    return masked_model, overlays, mp_cfg
-
-
 def run_sweep_for_experiment(
     exp: str,
     methods: List[str],
     sparsities: List[float],
     outdir: Path,
     gpu: Optional[int] = 0,
-    lbmask_progressive: bool = False,
     lbmask_schedules: Optional[list] = None,
-    lbmask_update_every: int = 100,
-    lbmask_hard_apply: bool = False,
-    freeze_base: bool = False,
     *,
     target_class: int = 0,
     apply_decomposition: bool = False,
@@ -302,120 +213,64 @@ def run_sweep_for_experiment(
         base_acc, _ = evaluate(model, test_dl, cfg, device)
 
         if method == "lbmask":
-            if lbmask_progressive:
-                # Train with schedule for each (schedule, sparsity) pair.
-                for sched in lbmask_schedules or ["constant", "linear", "cosine"]:
-                    for s in sparsities:
-                        mp_cfg = MaskPruneConfig(
-                            granularity="out",
-                            lr=5e-3,
-                            lmbda_l1=1e-3,
-                            num_epochs=cfg.num_epochs,
-                            skip_final_classifier=True,
-                            # Progressive pruning settings
-                            freeze_base=freeze_base,
-                            prune_during_train=True,
-                            schedule=sched,  # "constant" | "linear" | "cosine"
-                            start_sparsity=0.0,
-                            end_sparsity=s,
-                            begin_step=0,
-                            end_step=cfg.num_epochs * len(train_dl),
-                            update_every=lbmask_update_every,
-                            hard_apply=lbmask_hard_apply,
-                            zero_bias_when_masked=True,
-                        )
-                        masked_model, overlays = train_with_progressive_pruning(
-                            base_model=model,
-                            train_dl=train_dl,
-                            mp_cfg=mp_cfg,
-                            base_lr=cfg.lr,
-                            num_epochs=cfg.num_epochs,
-                            device=device,
-                        )
-                        pruned_model = export_pruned_copy(model, overlays).to(device)
-                        overall_sparsity, _ = calc_sparsity(pruned_model)
-                        acc_mc, _ = evaluate(pruned_model, test_dl, cfg, device)
-                        row = {
-                            "method": f"lbmask/{sched}",
-                            "target_sparsity": s,
-                            "achieved_sparsity": overall_sparsity / 100.0,
-                            "accuracy": acc_mc,
-                            "exp": exp,
-                            "model_name": cfg.model_name,
-                            "dataset": cfg.dataset_name,
-                            "base_accuracy": base_acc,
-                        }
-
-                        if apply_decomposition:
-                            decomp = decompose_to_two_classifiers(
-                                pruned_model, target_class
-                            ).to(device)
-                            acc_bin, _ = evaluate(
-                                decomp,
-                                test_dl,
-                                cfg,
-                                device,
-                                binary_target_idx=target_class,
-                            )
-                            row.update(
-                                {
-                                    "binary_accuracy": acc_bin,
-                                    "binary_target_class": target_class,
-                                }
-                            )
-
-                        all_rows.append(row)
-                continue
-
-            # Use the median of the sweep as a reasonable reference for logs.
-            ref = float(np.median(np.array(sparsities)))
-            masked_model, overlays, mp_cfg = train_lbmask_overlays_once(
-                model, train_dl, cfg, device, ref_target=ref
-            )
-            for s in sparsities:
-                cfg.sparsity_ratio = s  # just for bookkeeping
-                # Project with a per-s target using global threshold line-search.
-                thr, s_ratio = project_by_line_search(
-                    masked_model=masked_model,
-                    base_model=model,
-                    overlays=overlays,
-                    target_sparsity=s,
-                    tol=1e-3,
-                    max_iter=25,
-                    verbose=True,
-                )
-                # Export a pruned vanilla copy and evaluate.
-                pruned_model = export_pruned_copy(model, overlays).to(device)
-                overall_sparsity, _ = calc_sparsity(pruned_model)
-                acc_mc, _ = evaluate(pruned_model, test_dl, cfg, device)
-                row = {
-                    "method": "lbmask",
-                    "target_sparsity": s,
-                    "achieved_sparsity": overall_sparsity / 100.0,
-                    "accuracy": acc_mc,
-                    "threshold": float(thr),
-                    "line_search_achieved": float(s_ratio),
-                    "exp": exp,
-                    "model_name": cfg.model_name,
-                    "dataset": cfg.dataset_name,
-                    "base_accuracy": base_acc,
-                }
-
-                if apply_decomposition:
-                    decomp = decompose_to_two_classifiers(
-                        pruned_model, target_class
-                    ).to(device)
-                    acc_bin, _ = evaluate(
-                        decomp, test_dl, cfg, device, binary_target_idx=target_class
+            # Train with schedule for each (schedule, sparsity) pair.
+            for sched in lbmask_schedules or ["constant", "linear", "cosine"]:
+                for s in sparsities:
+                    mp_cfg = MaskPruneConfig(
+                        granularity="out",
+                        lr=5e-3,
+                        lmbda_l1=1e-3,
+                        num_epochs=cfg.num_epochs,
+                        skip_final_classifier=True,
+                        prune_during_train=True,
+                        schedule=sched,  # "constant" | "linear" | "cosine"
+                        start_sparsity=0.0,
+                        end_sparsity=s,
+                        begin_step=0,
+                        end_step=cfg.num_epochs * len(train_dl),
+                        zero_bias_when_masked=True,
                     )
-                    row.update(
-                        {
-                            "binary_accuracy": acc_bin,
-                            "binary_target_class": target_class,
-                        }
+                    masked_model, overlays = train_with_progressive_pruning(
+                        base_model=model,
+                        train_dl=train_dl,
+                        mp_cfg=mp_cfg,
+                        base_lr=cfg.lr,
+                        num_epochs=cfg.num_epochs,
+                        device=device,
                     )
+                    pruned_model = export_pruned_copy(model, overlays).to(device)
+                    overall_sparsity, _ = calc_sparsity(pruned_model)
+                    acc_mc, _ = evaluate(pruned_model, test_dl, cfg, device)
+                    row = {
+                        "method": f"lbmask/{sched}",
+                        "target_sparsity": s,
+                        "achieved_sparsity": overall_sparsity / 100.0,
+                        "accuracy": acc_mc,
+                        "exp": exp,
+                        "model_name": cfg.model_name,
+                        "dataset": cfg.dataset_name,
+                        "base_accuracy": base_acc,
+                    }
 
-                all_rows.append(row)
+                    if apply_decomposition:
+                        decomp = decompose_to_target_vs_rest(
+                            pruned_model, target_class
+                        ).to(device)
+                        acc_bin, _ = evaluate(
+                            decomp,
+                            test_dl,
+                            cfg,
+                            device,
+                            binary_target_idx=target_class,
+                        )
+                        row.update(
+                            {
+                                "binary_accuracy": acc_bin,
+                                "binary_target_class": target_class,
+                            }
+                        )
+
+                    all_rows.append(row)
         elif method == "wanda":
             # WANDA remains one-shot per sparsity (by design).
             for s in sparsities:
@@ -512,20 +367,12 @@ def main():
         help="Directory to save CSVs and plots",
     )
     parser.add_argument(
-        "--lbmask_progressive",
-        action="store_true",
-        help="Use in-training LB-Mask with sparsity schedules.",
-    )
-    parser.add_argument(
         "--lbmask_schedules",
         nargs="+",
         default=["constant", "linear", "cosine"],
         choices=["constant", "linear", "cosine"],
         help="Schedules to compare when --lbmask_progressive is set.",
     )
-    parser.add_argument("--lbmask_update_every", type=int, default=100)
-    parser.add_argument("--lbmask_hard_apply", action="store_true")
-    parser.add_argument("--freeze_base", action="store_true")
     parser.add_argument(
         "--target_class",
         type=int,
@@ -555,10 +402,7 @@ def main():
             args.sparsities,
             outdir,
             gpu=args.gpu,
-            lbmask_progressive=args.lbmask_progressive,
             lbmask_schedules=args.lbmask_schedules,
-            lbmask_update_every=args.lbmask_update_every,
-            lbmask_hard_apply=args.lbmask_hard_apply,
             freeze_base=args.freeze_base,
             target_class=args.target_class,
             apply_decomposition=args.decompose,
