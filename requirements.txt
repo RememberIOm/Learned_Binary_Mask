@@ -4,6 +4,7 @@ torchvision
 
 # Hugging Face ecosystem
 transformers
+accelerate
 datasets
 huggingface_hub
 

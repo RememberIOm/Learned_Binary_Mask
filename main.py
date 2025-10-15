@@ -80,9 +80,12 @@ class ExpConfig:
     scheduler: str = "linear"  # "linear" | "cosine" | "constant"
     seed: int = 42
     eval_steps: int = 500
-    save_strategy: str = "epoch"  # "epoch" | "steps"
+    save_strategy: str = "best"  # "no" | "steps" | "epoch" | "best"
+    eval_strategy: str = "no"
+    logging_steps: int = 50
     fp16: bool = False
     grad_checkpointing: bool = False
+    num_workers: int = 4  # for DataLoader
 
     gpu: Optional[int] = 0
     save_dir: str = "./finetuned_model"
@@ -273,15 +276,24 @@ def prepare_dataloaders(cfg: ExpConfig, processor):
         tokenized.set_format("torch")
 
         train_ds = tokenized["train"]
-        test_dl = DataLoader(tokenized["test"], batch_size=cfg.batch_size)
 
         calib_idx = np.random.choice(
             len(train_ds), min(cfg.calib_nlp, len(train_ds)), replace=False
         )
         calib_ds = Subset(train_ds, calib_idx)
 
-        train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-        calib_dl = DataLoader(calib_ds, batch_size=8)
+        test_ds = tokenized["test"]
+
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+        )
+        calib_dl = DataLoader(calib_ds, batch_size=8, num_workers=cfg.num_workers)
+        test_dl = DataLoader(
+            test_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers
+        )
         return train_dl, test_dl, calib_dl
 
     # Vision
@@ -362,16 +374,10 @@ def train(model: nn.Module, train_dl: DataLoader, cfg: ExpConfig, device: torch.
     model.to(device)
 
     # Derive datasets from the existing DataLoader(s).
-    # We keep the signature unchanged to avoid touching other call sites.
     train_ds = train_dl.dataset
-    eval_ds = None  # Keep evaluation off here; main/runers will evaluate separately.
+    eval_ds = None
 
-    # Keep behavior close to the original loop:
-    # - no intermediate eval/saving by default
-    # - simple linear schedule with warmup
-    # - logging every ~10% of an epoch
     steps_per_epoch = max(1, len(train_dl))
-    logging_steps = max(10, steps_per_epoch // 10)
 
     training_args = TrainingArguments(
         output_dir=os.path.join(cfg.save_dir, "trainer_tmp"),
@@ -379,15 +385,16 @@ def train(model: nn.Module, train_dl: DataLoader, cfg: ExpConfig, device: torch.
         per_device_eval_batch_size=cfg.batch_size,
         num_train_epochs=cfg.num_epochs,
         learning_rate=cfg.lr,
-        weight_decay=0.01,
-        warmup_ratio=0.06,
-        lr_scheduler_type="linear",
-        logging_steps=logging_steps,
-        save_strategy="none",  # keep model saving under our control (below)
-        evaluation_strategy="no",  # we run eval after training via existing code
-        dataloader_pin_memory=False,  # safer across CPU/GPU switching
-        seed=42,
-        fp16=torch.cuda.is_available(),
+        weight_decay=cfg.weight_decay,
+        warmup_ratio=cfg.warmup_ratio,
+        lr_scheduler_type=cfg.scheduler,
+        logging_steps=cfg.logging_steps,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        save_strategy=cfg.save_strategy,  # <- 'no'|'steps'|'epoch'|'best'
+        eval_strategy=cfg.eval_strategy,
+        dataloader_pin_memory=False,
+        seed=cfg.seed,
+        fp16=(cfg.fp16 and torch.cuda.is_available()),  # <- gated by --fp16
         report_to=(
             ["wandb"] if (getattr(cfg, "use_wandb", False) and _WANDB_AVAILABLE) else []
         ),
@@ -396,8 +403,8 @@ def train(model: nn.Module, train_dl: DataLoader, cfg: ExpConfig, device: torch.
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
+        train_dataset=train_dl.dataset,
+        eval_dataset=None,
         data_collator=default_data_collator,
         # tokenizer is optional; we save tokenizer/processor explicitly elsewhere
     )
@@ -623,36 +630,37 @@ def run_experiment(cfg: ExpConfig):
 # =========================== CLI presets ===========================
 
 
-def build_default_bert(args, gpu) -> ExpConfig:
-    num_labels_map = {
-        "ag_news": 4,
-        "dbpedia_14": 14,
-    }
-
+def build_default_bert(
+    gpu: Optional[int],
+    prune_method: str,
+    model_size: str,
+    sparsity: float,
+    dataset: str,
+) -> ExpConfig:
+    num_labels_map = {"ag_news": 4, "dbpedia_14": 14}
     return ExpConfig(
-        model_name=f"prajjwal1/bert-{args.model_size}",
-        dataset_name=args.dataset,
+        model_name=f"prajjwal1/bert-{model_size}",
+        dataset_name=dataset,
         task_type="nlp",
-        num_labels=num_labels_map.get(args.dataset, 10),
-        # ---- Bind CLI hyperparameters ----
-        batch_size=args.batch_size,
-        num_epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        max_length=args.max_length,
-        gradient_accumulation_steps=args.grad_accum_steps,
-        scheduler=args.scheduler,
-        seed=args.seed,
-        eval_steps=args.eval_steps,
-        save_strategy=args.save_strategy,
-        fp16=args.fp16,
-        grad_checkpointing=args.grad_checkpointing,
+        num_labels=num_labels_map.get(dataset, 10),
+        batch_size=32,
+        num_epochs=3,
+        lr=2e-5,
+        weight_decay=0.01,
+        warmup_ratio=0.06,
+        max_length=128,
+        scheduler="linear",
+        seed=42,
+        save_strategy="epoch",
+        eval_strategy="no",
+        logging_steps=50,
+        fp16=False,
         gpu=gpu,
-        save_dir=f"./finetuned_bert_{args.model_size}_{args.dataset}",
-        prune_method=args.method,
-        sparsity_ratio=args.sparsity,
+        save_dir=f"./finetuned_bert_{model_size}_{dataset}",
+        prune_method=prune_method,
+        sparsity_ratio=sparsity,
         use_wandb=False,
+        num_workers=4,
     )
 
 
@@ -744,48 +752,74 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_ratio", type=float, default=0.06)
-    parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--warmup_ratio", type=float, default=0.0)
     parser.add_argument(
         "--scheduler",
         type=str,
         default="linear",
-        choices=["linear", "cosine", "constant"],
+        choices=[
+            "linear",
+            "cosine",
+            "cosine_with_restarts",
+            "polynomial",
+            "constant",
+            "constant_with_warmup",
+        ],
     )
+    parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--eval_steps", type=int, default=500)
-    parser.add_argument(
-        "--save_strategy", type=str, default="epoch", choices=["epoch", "steps"]
-    )
     parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--grad_checkpointing", action="store_true")
+    parser.add_argument(
+        "--save_strategy",
+        type=str,
+        default="best",
+        choices=["no", "steps", "epoch", "best"],
+    )
+    parser.add_argument(
+        "--eval_strategy",
+        type=str,
+        default="no",
+        choices=["no", "steps", "epoch"],
+    )
+    parser.add_argument("--logging_steps", type=int, default=50)
+    parser.add_argument("--num_workers", type=int, default=4)
 
     args = parser.parse_args()
 
-    cfg = (
-        build_default_bert(args, None if args.gpu < 0 else args.gpu)
-        if args.exp == "bert"
-        else build_default_vit(
+    if args.exp == "bert":
+        cfg = build_default_bert(
             args.gpu, args.method, args.model_size, args.sparsity, args.dataset
         )
-    )
+    else:
+        cfg = build_default_vit(
+            args.gpu, args.method, args.model_size, args.sparsity, args.dataset
+        )
 
-    # ---- CLI -> ExpConfig overrides (names + minor normalization) ----
-    # Keep method selected on CLI (already used by presets, but set explicitly for clarity)
-    cfg.prune_method = args.method
+    cfg.batch_size = args.batch_size
+    cfg.num_epochs = args.epochs
+    cfg.lr = args.lr
+    cfg.weight_decay = args.weight_decay
+    cfg.warmup_ratio = args.warmup_ratio
+    cfg.max_length = args.max_length
+    cfg.scheduler = args.scheduler
+    cfg.seed = args.seed
+    cfg.fp16 = args.fp16
+    cfg.save_strategy = args.save_strategy
+    cfg.eval_strategy = args.eval_strategy
+    cfg.logging_steps = args.logging_steps
+    cfg.num_workers = args.num_workers
 
-    # Map CLI schedule knobs into ExpConfig field names
+    # pruning-specific
     cfg.prune_schedule = args.prune_schedule
-    cfg.prune_start_sparsity = args.prune_start  # CLI uses --prune_start
-    cfg.prune_end_sparsity = args.prune_end  # CLI uses --prune_end
+    cfg.prune_start_sparsity = args.prune_start
+    cfg.prune_end_sparsity = args.prune_end
     cfg.prune_begin_step = args.prune_begin_step
-    # Normalize -1 to None (means "use total_steps")
     cfg.prune_end_step = None if args.prune_end_step < 0 else args.prune_end_step
     cfg.prune_update_every = args.prune_update_every
     cfg.hard_apply = args.hard_apply
 
+    # decomposition options
     cfg.target_class = args.target_class
     cfg.apply_decomposition = not args.no_decomposition
 
