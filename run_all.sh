@@ -7,6 +7,8 @@
 
 set -euo pipefail
 
+export TOKENIZERS_PARALLELISM=false
+
 RATIOS="0.0 0.25 0.5 0.75 1.0"
 METHODS=("wanda" "lbmask")
 SPARSITY="0.5"
