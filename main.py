@@ -29,7 +29,9 @@ from transformers import (
     AutoImageProcessor,
     AutoModelForSequenceClassification,
     AutoModelForImageClassification,
-    get_scheduler,
+    Trainer,
+    TrainingArguments,
+    default_data_collator,
 )
 
 # Local modules
@@ -64,14 +66,24 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 class ExpConfig:
     # Generic
     model_name: str
-    dataset_name: (
-        str  # "ag_news" | "cifar10" | "fashion_mnist" | "yahoo_answers_topics"
-    )
+    dataset_name: str
     task_type: str  # "nlp" | "vision"
     num_labels: int
+
     batch_size: int = 32
     num_epochs: int = 3
     lr: float = 2e-5
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.06
+    max_length: int = 128  # for NLP
+    gradient_accumulation_steps: int = 1
+    scheduler: str = "linear"  # "linear" | "cosine" | "constant"
+    seed: int = 42
+    eval_steps: int = 500
+    save_strategy: str = "epoch"  # "epoch" | "steps"
+    fp16: bool = False
+    grad_checkpointing: bool = False
+
     gpu: Optional[int] = 0
     save_dir: str = "./finetuned_model"
     use_wandb: bool = False
@@ -144,18 +156,22 @@ def class_names_for(dataset_name: str) -> Optional[List[str]]:
         ]
     if dataset_name == "ag_news":
         return ["World", "Sports", "Business", "Sci/Tech"]
-    if dataset_name == "yahoo_answers_topics":
+    if dataset_name == "dbpedia_14":
         return [
-            "Society & Culture",
-            "Science & Mathematics",
-            "Health",
-            "Education & Reference",
-            "Computers & Internet",
-            "Sports",
-            "Business & Finance",
-            "Entertainment & Music",
-            "Family & Relationships",
-            "Politics & Government",
+            "Company",
+            "EducationalInstitution",
+            "Artist",
+            "Athlete",
+            "OfficeHolder",
+            "MeanOfTransportation",
+            "Building",
+            "NaturalPlace",
+            "Village",
+            "Animal",
+            "Plant",
+            "Album",
+            "Film",
+            "WrittenWork",
         ]
     return None
 
@@ -201,31 +217,47 @@ def prepare_dataloaders(cfg: ExpConfig, processor):
     if cfg.task_type == "nlp":
         if cfg.dataset_name == "ag_news":
             ds = load_dataset(cfg.dataset_name)
-        elif cfg.dataset_name == "yahoo_answers_topics":
-            ds = load_dataset(cfg.dataset_name)
+        elif cfg.dataset_name == "dbpedia_14":
+            ds = load_dataset("dbpedia_14")
 
+            # DBpedia: combine title + content → text
             def _build_text(ex):
-                title = ex.get("question_title", "") or ""
-                content = ex.get("question_content", "") or ""
-                answer = ex.get("best_answer", "") or ""
-                ex["text"] = " ".join([s for s in (title, content, answer) if s])
+                title = ex.get("title", "") or ""
+                content = ex.get("content", "") or ""
+                ex["text"] = " ".join([s for s in (title, content) if s]).strip()
                 return ex
 
             ds = ds.map(_build_text)
+        else:
+            raise ValueError(f"Unknown NLP dataset: {cfg.dataset_name}")
 
         def tok_fn(ex):
+            # Tokenize prepared 'text'
             return processor(
-                ex["text"], padding="max_length", truncation=True, max_length=128
+                ex["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=cfg.max_length,
             )
 
         tokenized = ds.map(tok_fn, batched=True)
-        tokenized = tokenized.remove_columns(
-            [
-                c
-                for c in tokenized["train"].column_names
-                if c in ["text", "question_title", "question_content", "best_answer"]
-            ]
-        )
+
+        # Drop raw text-ish columns (keep only model inputs + labels)
+        drop_cols = {
+            "text",
+            "question_title",
+            "question_content",
+            "best_answer",
+            "title",
+            "content",
+            "id",
+            "idx",
+            "guid",
+        }
+        keep = [c for c in tokenized["train"].column_names if c not in drop_cols]
+        tokenized = tokenized.select_columns(keep)
+
+        # Normalize label column name
         train_cols = set(tokenized["train"].column_names)
         if "labels" in train_cols:
             pass
@@ -235,25 +267,10 @@ def prepare_dataloaders(cfg: ExpConfig, processor):
             tokenized = tokenized.rename_column("topic", "labels")
         else:
             raise ValueError(
-                f"Could not find label column. Available columns: {sorted(train_cols)}"
+                f"Could not find label column. Available: {sorted(train_cols)}"
             )
+
         tokenized.set_format("torch")
-        _drop = [
-            c
-            for c in tokenized["train"].column_names
-            if c
-            in [
-                "text",
-                "question_title",
-                "question_content",
-                "best_answer",
-                "id",
-                "idx",
-                "guid",
-            ]
-        ]
-        if _drop:
-            tokenized = tokenized.remove_columns(_drop)
 
         train_ds = tokenized["train"]
         test_dl = DataLoader(tokenized["test"], batch_size=cfg.batch_size)
@@ -341,36 +358,52 @@ def prepare_dataloaders(cfg: ExpConfig, processor):
 
 
 def train(model: nn.Module, train_dl: DataLoader, cfg: ExpConfig, device: torch.device):
-    """Simple fine-tuning loop."""
+    """Fine-tune using Hugging Face Trainer."""
     model.to(device)
-    model.train()
 
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    num_steps = cfg.num_epochs * len(train_dl)
-    sched = get_scheduler(
-        "linear",
-        optimizer=opt,
-        num_warmup_steps=min(500, num_steps // 10),
-        num_training_steps=num_steps,
+    # Derive datasets from the existing DataLoader(s).
+    # We keep the signature unchanged to avoid touching other call sites.
+    train_ds = train_dl.dataset
+    eval_ds = None  # Keep evaluation off here; main/runers will evaluate separately.
+
+    # Keep behavior close to the original loop:
+    # - no intermediate eval/saving by default
+    # - simple linear schedule with warmup
+    # - logging every ~10% of an epoch
+    steps_per_epoch = max(1, len(train_dl))
+    logging_steps = max(10, steps_per_epoch // 10)
+
+    training_args = TrainingArguments(
+        output_dir=os.path.join(cfg.save_dir, "trainer_tmp"),
+        per_device_train_batch_size=cfg.batch_size,
+        per_device_eval_batch_size=cfg.batch_size,
+        num_train_epochs=cfg.num_epochs,
+        learning_rate=cfg.lr,
+        weight_decay=0.01,
+        warmup_ratio=0.06,
+        lr_scheduler_type="linear",
+        logging_steps=logging_steps,
+        save_strategy="none",  # keep model saving under our control (below)
+        evaluation_strategy="no",  # we run eval after training via existing code
+        dataloader_pin_memory=False,  # safer across CPU/GPU switching
+        seed=42,
+        fp16=torch.cuda.is_available(),
+        report_to=(
+            ["wandb"] if (getattr(cfg, "use_wandb", False) and _WANDB_AVAILABLE) else []
+        ),
     )
 
-    for ep in range(1, cfg.num_epochs + 1):
-        running = 0.0
-        for batch in tqdm(train_dl, desc=f"Epoch {ep}"):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            out = model(**batch)
-            loss = out.loss
-            running += float(loss.item())
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=default_data_collator,
+        # tokenizer is optional; we save tokenizer/processor explicitly elsewhere
+    )
 
-            loss.backward()
-            opt.step()
-            sched.step()
-            opt.zero_grad()
-
-        avg_loss = running / max(1, len(train_dl))
-        print(f"[Train] epoch={ep} loss={avg_loss:.4f}")
-        if cfg.use_wandb and _WANDB_AVAILABLE:
-            wandb.log({"epoch": ep, "train_loss": avg_loss})
+    # Run training (handles optimizer/scheduler/gradient steps internally)
+    trainer.train()
 
 
 # =========================== Evaluation ===========================
@@ -590,27 +623,35 @@ def run_experiment(cfg: ExpConfig):
 # =========================== CLI presets ===========================
 
 
-def build_default_bert(
-    gpu: Optional[int],
-    prune_method: str,
-    model_size: str,
-    sparsity: float,
-    dataset: str,
-) -> ExpConfig:
-    # AG News (4-way), BERT
+def build_default_bert(args, gpu) -> ExpConfig:
+    num_labels_map = {
+        "ag_news": 4,
+        "dbpedia_14": 14,
+    }
+
     return ExpConfig(
-        model_name=f"prajjwal1/bert-{model_size}",
-        dataset_name=dataset,
+        model_name=f"prajjwal1/bert-{args.model_size}",
+        dataset_name=args.dataset,
         task_type="nlp",
-        num_labels=4 if dataset == "ag_news" else 10,
-        batch_size=32,
-        num_epochs=3,
-        lr=2e-5,
+        num_labels=num_labels_map.get(args.dataset, 10),
+        # ---- Bind CLI hyperparameters ----
+        batch_size=args.batch_size,
+        num_epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        max_length=args.max_length,
+        gradient_accumulation_steps=args.grad_accum_steps,
+        scheduler=args.scheduler,
+        seed=args.seed,
+        eval_steps=args.eval_steps,
+        save_strategy=args.save_strategy,
+        fp16=args.fp16,
+        grad_checkpointing=args.grad_checkpointing,
         gpu=gpu,
-        save_dir=f"./finetuned_bert_{model_size}_{dataset}",
-        prune_method=prune_method,
-        sparsity_ratio=sparsity,
-        nm_values=(2, 4) if prune_method == "wanda_nm" else None,
+        save_dir=f"./finetuned_bert_{args.model_size}_{args.dataset}",
+        prune_method=args.method,
+        sparsity_ratio=args.sparsity,
         use_wandb=False,
     )
 
@@ -663,7 +704,7 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="ag_news",
-        choices=["ag_news", "yahoo_answers_topics", "cifar10", "fashion_mnist"],
+        choices=["ag_news", "dbpedia_14", "cifar10", "fashion_mnist"],
         help="dataset name",
     )
     parser.add_argument(
@@ -700,12 +741,31 @@ if __name__ == "__main__":
         help="skip two-head decomposition (keep multiclass head)",
     )
 
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_ratio", type=float, default=0.06)
+    parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine", "constant"],
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval_steps", type=int, default=500)
+    parser.add_argument(
+        "--save_strategy", type=str, default="epoch", choices=["epoch", "steps"]
+    )
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--grad_checkpointing", action="store_true")
+
     args = parser.parse_args()
 
     cfg = (
-        build_default_bert(
-            args.gpu, args.method, args.model_size, args.sparsity, args.dataset
-        )
+        build_default_bert(args, None if args.gpu < 0 else args.gpu)
         if args.exp == "bert"
         else build_default_vit(
             args.gpu, args.method, args.model_size, args.sparsity, args.dataset
@@ -717,7 +777,6 @@ if __name__ == "__main__":
     cfg.prune_method = args.method
 
     # Map CLI schedule knobs into ExpConfig field names
-    cfg.prune_during_train = args.prune_during_train
     cfg.prune_schedule = args.prune_schedule
     cfg.prune_start_sparsity = args.prune_start  # CLI uses --prune_start
     cfg.prune_end_sparsity = args.prune_end  # CLI uses --prune_end
@@ -726,9 +785,6 @@ if __name__ == "__main__":
     cfg.prune_end_step = None if args.prune_end_step < 0 else args.prune_end_step
     cfg.prune_update_every = args.prune_update_every
     cfg.hard_apply = args.hard_apply
-
-    # If --freeze_base is set, we freeze backbone weights during progressive pruning
-    cfg.freeze_base = args.freeze_base
 
     cfg.target_class = args.target_class
     cfg.apply_decomposition = not args.no_decomposition

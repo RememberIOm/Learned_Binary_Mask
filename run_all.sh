@@ -14,7 +14,7 @@ SPARSITY="0.5"
 run_job() {
   local EXP="$1"        # bert | vit
   local SIZE="$2"       # tiny | small
-  local DATASET="$3"    # ag_news | yahoo_answers_topics | cifar10 | fashion_mnist
+  local DATASET="$3"    # ag_news | dbpedia_14 | cifar10 | fashion_mnist
   local NUM_CLASSES="$4"
 
   for TC in $(seq 0 $((NUM_CLASSES-1))); do
@@ -35,10 +35,10 @@ run_job() {
 }
 
 # Examples:
-run_job bert tiny ag_news 4
-# run_job bert tiny yahoo_answers_topics 10
+# run_job bert tiny ag_news 4
+run_job bert tiny dbpedia_14 14
 # run_job bert small ag_news 4
-# run_job bert small yahoo_answers_topics 10
+# run_job bert small dbpedia_14 14
 # run_job vit tiny cifar10 10
 # run_job vit tiny fashion_mnist 10
 # run_job vit small cifar10 10

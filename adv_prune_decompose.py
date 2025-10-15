@@ -445,7 +445,7 @@ def main():
         "--dataset",
         type=str,
         default="ag_news",
-        choices=["ag_news", "yahoo_answers_topics", "cifar10", "fashion_mnist"],
+        choices=["ag_news", "dbpedia_14", "cifar10", "fashion_mnist"],
     )
     parser.add_argument("--methods", nargs="+", default=["wanda", "lbmask"])
     parser.add_argument(
