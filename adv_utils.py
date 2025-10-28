@@ -268,46 +268,60 @@ def vision_adv_dataset(
             base_logits = out.logits
             base_pred = base_logits.argmax(dim=-1)
 
-        # Sweep epsilon and find the first change
-        selected = None
+        # For each sample, track the first crossing step; fall back to eps_max if none.
+        B = x.size(0)
+        selected = [None] * B
+        done = torch.zeros(B, dtype=torch.bool, device=device)
+
         for k in range(1, num_steps + 1):
             eps_curr_px = eps_start_px + k * eps_step_px
             eps_prev_px = eps_curr_px - eps_step_px
 
-            if std_t is not None:
-                step_curr = eps_curr_px / std_t
-                step_prev = eps_prev_px / std_t
-            else:
-                step_curr = torch.as_tensor(eps_curr_px, device=x.device, dtype=x.dtype)
-                step_prev = torch.as_tensor(eps_prev_px, device=x.device, dtype=x.dtype)
+            step_curr = (
+                (eps_curr_px / std_t)
+                if std_t is not None
+                else torch.as_tensor(eps_curr_px, device=x.device, dtype=x.dtype)
+            )
+            step_prev = (
+                (eps_prev_px / std_t)
+                if std_t is not None
+                else torch.as_tensor(eps_prev_px, device=x.device, dtype=x.dtype)
+            )
 
             adv_prev = x + step_prev * direction
             adv_curr = x + step_curr * direction
 
             if (min_val is not None) and (max_val is not None):
-                adv_prev = torch.maximum(torch.minimum(adv_prev, max_val), min_val)
-                adv_curr = torch.maximum(torch.minimum(adv_curr, max_val), min_val)
+                adv_prev = torch.clamp(adv_prev, min=min_val, max=max_val)
+                adv_curr = torch.clamp(adv_curr, min=min_val, max=max_val)
 
             with torch.no_grad():
+                pred_prev = model(pixel_values=adv_prev).logits.argmax(dim=-1)
                 pred_curr = model(pixel_values=adv_curr).logits.argmax(dim=-1)
 
-            if not torch.equal(pred_curr, base_pred):
-                selected = adv_curr  # or 0.5 * (adv_prev + adv_curr) for mid-point
-                break
+            cross = (~done) & (pred_prev.eq(base_pred)) & (~pred_curr.eq(base_pred))
+            if cross.any():
+                idx = torch.nonzero(cross).view(-1)
+                for i in idx.tolist():
+                    selected[i] = adv_curr[i].detach().cpu()
+                done[idx] = True
 
-        if selected is None:
-            # Fallback: take the largest epsilon if no change occurred
-            if std_t is not None:
-                step_max = eps_max_px / std_t
-            else:
-                step_max = torch.as_tensor(eps_max_px, device=x.device, dtype=x.dtype)
-            selected = x + step_max * direction
+        # Fallback for samples without crossing
+        if (~done).any():
+            step_max = (
+                (eps_max_px / std_t)
+                if std_t is not None
+                else torch.as_tensor(eps_max_px, device=x.device, dtype=x.dtype)
+            )
+            adv_max = x + step_max * direction
             if (min_val is not None) and (max_val is not None):
-                selected = torch.maximum(torch.minimum(selected, max_val), min_val)
+                adv_max = torch.clamp(adv_max, min=min_val, max=max_val)
+            for i in torch.nonzero(~done).view(-1).tolist():
+                selected[i] = adv_max[i].detach().cpu()
 
-        selected = selected.detach()
-        for i in range(x.size(0)):
-            items.append({"pixel_values": selected[i].cpu(), "labels": y[i].cpu()})
+        # Append per-sample chosen adversarial examples
+        for i in range(B):
+            items.append({"pixel_values": selected[i], "labels": y[i].cpu()})
 
         seen += 1
         if max_batches is not None and seen >= max_batches:
@@ -368,41 +382,3 @@ def make_mixed_loader(
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
-
-
-# ---------- Evaluation on adversarial test sets ----------
-
-
-@torch.no_grad()
-def evaluate_adv_accuracy(
-    model,
-    adv_loader: DataLoader,
-    device: torch.device,
-) -> float:
-    """
-    Generic accuracy on adversarial loader.
-    Works for loaders that emit either:
-      - {inputs_embeds, attention_mask, labels}  (NLP)
-      - {pixel_values, labels}                  (Vision)
-    """
-    model.eval()
-    model.to(device)
-    total = 0
-    correct = 0
-
-    for batch in adv_loader:
-        if "pixel_values" in batch:
-            x = batch["pixel_values"].to(device)
-            y = batch["labels"].to(device)
-            logits = model(pixel_values=x).logits
-        else:
-            x = batch["inputs_embeds"].to(device)
-            attn = batch["attention_mask"].to(device)
-            y = batch["labels"].to(device)
-            logits = model(inputs_embeds=x, attention_mask=attn).logits
-
-        pred = logits.argmax(dim=-1)
-        total += y.numel()
-        correct += int((pred == y).sum().item())
-
-    return correct / max(1, total)

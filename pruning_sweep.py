@@ -35,22 +35,13 @@ import torch
 import matplotlib.pyplot as plt
 
 # Local modules
-from main import (
-    ExpConfig,
-    get_device,
-    is_vision,
-    load_model_and_processor,
-    prepare_dataloaders,
-    train,
-    evaluate,
-    build_default_bert,
-    build_default_vit,
-)
+from config import ExpConfig, build_default_bert, build_default_vit
+from data_utils import is_vision, prepare_dataloaders
+from evaluation import evaluate
+from model_utils import get_device, load_model_and_processor
+from training import train
 from learned_binary_mask_pruning import (
     MaskPruneConfig,
-    build_masked_model_from,
-    train_masks,
-    project_by_line_search,
     export_pruned_copy,
     calc_sparsity,  # generic sparsity util
     train_with_progressive_pruning,
@@ -299,9 +290,16 @@ def run_sweep_for_experiment(
 
         # Save CSV per-method for convenience (handles heterogeneous keys)
         csv_path = results_dir / f"{exp.replace(':','_')}_{method}.csv"
-        method_rows = [
-            rr for rr in all_rows if rr["method"] == method and rr["exp"] == exp
-        ]
+        if method == "lbmask":
+            method_rows = [
+                rr
+                for rr in all_rows
+                if rr["method"].startswith("lbmask/") and rr["exp"] == exp
+            ]
+        else:
+            method_rows = [
+                rr for rr in all_rows if rr["method"] == method and rr["exp"] == exp
+            ]
         _write_csv(csv_path, method_rows)
 
     # Also save a merged CSV for the experiment
@@ -311,17 +309,17 @@ def run_sweep_for_experiment(
 
     # Plot accuracy vs sparsity (one chart per experiment; multiple lines for methods)
     plt.figure()
-    for method in methods:
+    lines = sorted({r["method"] for r in all_rows if r["exp"] == exp})
+    for mname in lines:
         xs = [
             r["target_sparsity"]
             for r in all_rows
-            if r["method"] == method and r["exp"] == exp
+            if r["method"] == mname and r["exp"] == exp
         ]
         ys = [
-            r["accuracy"] for r in all_rows if r["method"] == method and r["exp"] == exp
+            r["accuracy"] for r in all_rows if r["method"] == mname and r["exp"] == exp
         ]
-        # Matplotlib default colors; no explicit color per instructions
-        plt.plot(xs, ys, marker="o", label=method.upper())
+        plt.plot(xs, ys, marker="o", label=mname.upper())
     plt.xlabel("Target sparsity (ratio)")
     plt.ylabel("Accuracy")
     plt.title(f"Accuracy vs Sparsity — {exp}")
@@ -403,7 +401,6 @@ def main():
             outdir,
             gpu=args.gpu,
             lbmask_schedules=args.lbmask_schedules,
-            freeze_base=args.freeze_base,
             target_class=args.target_class,
             apply_decomposition=args.decompose,
         )

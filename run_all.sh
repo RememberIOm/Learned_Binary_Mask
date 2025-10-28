@@ -2,13 +2,14 @@
 # run_all.sh
 # Purpose: Run decomposition-aware pruning and evaluation over adversarial ratios.
 # Notes:
-#   - Uses adv_prune_decompose.py (no fine-tuning of base weights).
+#   - Uses adv_prune_decompose.py which correctly handles the prune-then-decompose workflow.
 #   - Set CUDA_VISIBLE_DEVICES outside when you need a specific GPU.
 
 set -euo pipefail
 
 export TOKENIZERS_PARALLELISM=false
 
+# Define shared parameters for the experiments.
 RATIOS="0.0 0.25 0.5 0.75 1.0"
 METHODS=("wanda" "lbmask")
 SPARSITY="0.5"
@@ -19,9 +20,10 @@ run_job() {
   local DATASET="$3"    # ag_news | dbpedia_14 | cifar10 | fashion_mnist
   local NUM_CLASSES="$4"
 
+  # Iterate through each target class to run the full prune-then-decompose pipeline.
+  # The python script handles the inner loops over methods and ratios.
   for TC in $(seq 0 $((NUM_CLASSES-1))); do
-    echo "[RUN] exp=$EXP size=$SIZE dataset=$DATASET target_class=$TC"
-    local OUTDIR="./results_adv_decompose/${EXP}_${SIZE}_${DATASET}"
+    echo "Running job for ${EXP}/${SIZE}/${DATASET} with target class ${TC}"
     python adv_prune_decompose.py \
       --exp "$EXP" \
       --model_size "$SIZE" \
@@ -29,19 +31,25 @@ run_job() {
       --methods "${METHODS[@]}" \
       --ratios $RATIOS \
       --sparsity "$SPARSITY" \
-      --eps-start-nlp 0.0 --eps-max-nlp 0.25 --eps-step-nlp 0.01 \
-      --eps-start-vision 0.0 --eps-max-vision $(python - <<<'print(8/255)') --eps-step-vision $(python - <<<'print(2/255)') \
       --target_class "$TC" \
-      --outdir "$OUTDIR"
+      --outdir "./results_adv_decompose/${EXP}_${SIZE}_${DATASET}"
   done
 }
 
-# Examples:
-# run_job bert tiny ag_news 4
-run_job bert tiny dbpedia_14 14
-# run_job bert small ag_news 4
+# --- Experiment Definitions ---
+# The following lines define the experiments to be run.
+# Each call to 'run_job' will execute the full evaluation
+# for a specific model, dataset, and for all its classes.
+
+# Example: BERT on DBPedia-14
 # run_job bert small dbpedia_14 14
-# run_job vit tiny cifar10 10
-# run_job vit tiny fashion_mnist 10
+
+# Example: ViT on CIFAR-10
 # run_job vit small cifar10 10
+
+# Example: BERT on AG News
+run_job bert tiny ag_news 4
+# run_job bert small ag_news 4
+
+# Example: ViT on Fashion MNIST
 # run_job vit small fashion_mnist 10
