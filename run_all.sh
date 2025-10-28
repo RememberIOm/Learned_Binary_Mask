@@ -11,7 +11,8 @@ export TOKENIZERS_PARALLELISM=false
 
 # Define shared parameters for the experiments.
 RATIOS="0.0 0.25 0.5 0.75 1.0"
-METHODS=("wanda" "lbmask")
+# METHODS=("wanda" "lbmask" "mi")
+METHODS=("wanda" "mi")
 SPARSITY="0.5"
 
 run_job() {
@@ -32,7 +33,8 @@ run_job() {
       --ratios $RATIOS \
       --sparsity "$SPARSITY" \
       --target_class "$TC" \
-      --outdir "./results_adv_decompose/${EXP}_${SIZE}_${DATASET}"
+      # --outdir "./results_adv_decompose/${EXP}_${SIZE}_${DATASET}"
+      --outdir "./results_adv_decompose_no_robust/${EXP}_${SIZE}_${DATASET}"
   done
 }
 

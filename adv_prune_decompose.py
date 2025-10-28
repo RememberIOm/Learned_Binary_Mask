@@ -149,23 +149,23 @@ def run_decompose_prune_once(
         )
 
         # Adversarial test loader & accuracy
-        adv_test_loader = build_adversarial_test_loader(
-            pruned,
-            test_dl,
-            cfg,
-            device,
-            eps_nlp=eps_nlp,
-            eps_vision=eps_vis,
-            vision_stats=vision_stats,
-        )
-        robust_acc, _ = evaluate_to_csv(
-            pruned,
-            adv_test_loader,
-            cfg,
-            device,
-            out_csv=out_base / "multiclass_adversarial.csv",
-            binary_target_idx=None,
-        )
+        # adv_test_loader = build_adversarial_test_loader(
+        #     pruned,
+        #     test_dl,
+        #     cfg,
+        #     device,
+        #     eps_nlp=eps_nlp,
+        #     eps_vision=eps_vis,
+        #     vision_stats=vision_stats,
+        # )
+        # robust_acc, _ = evaluate_to_csv(
+        #     pruned,
+        #     adv_test_loader,
+        #     cfg,
+        #     device,
+        #     out_csv=out_base / "multiclass_adversarial.csv",
+        #     binary_target_idx=None,
+        # )
 
         row = {
             "method": method,
@@ -173,7 +173,7 @@ def run_decompose_prune_once(
             "sparsity_target": sparsity,
             "sparsity_achieved_pct": overall_sparsity,
             "acc_original": acc_orig,
-            "acc_adversarial": robust_acc,
+            # "acc_adversarial": robust_acc,
         }
 
         if target_class is not None:
@@ -189,30 +189,30 @@ def run_decompose_prune_once(
                 binary_target_idx=target_class,
             )
             # Adversarial-only (binary)
-            adv_test_loader_bin = build_adversarial_test_loader(
-                decomp,
-                test_dl,
-                cfg,
-                device,
-                eps_nlp=eps_nlp,
-                eps_vision=eps_vis,
-                vision_stats=vision_stats,
-                binary_target_idx=target_class,
-            )
-            bin_acc_adv, _ = evaluate_to_csv(
-                decomp,
-                adv_test_loader_bin,
-                cfg,
-                device,
-                out_csv=out_bin / "binary_adversarial.csv",
-                binary_target_idx=target_class,
-            )
+            # adv_test_loader_bin = build_adversarial_test_loader(
+            #     decomp,
+            #     test_dl,
+            #     cfg,
+            #     device,
+            #     eps_nlp=eps_nlp,
+            #     eps_vision=eps_vis,
+            #     vision_stats=vision_stats,
+            #     binary_target_idx=target_class,
+            # )
+            # bin_acc_adv, _ = evaluate_to_csv(
+            #     decomp,
+            #     adv_test_loader_bin,
+            #     cfg,
+            #     device,
+            #     out_csv=out_bin / "binary_adversarial.csv",
+            #     binary_target_idx=target_class,
+            # )
 
             row.update(
                 {
                     "binary_target": int(target_class),
                     "binary_acc_original": bin_acc_orig,
-                    "binary_acc_adversarial": bin_acc_adv,
+                    # "binary_acc_adversarial": bin_acc_adv,
                 }
             )
 
@@ -337,12 +337,13 @@ def main():
         msg = (
             f"{rr['method']:>6s} | adv={rr['adv_ratio']:.2f} | "
             f"sp={rr['sparsity_achieved_pct']:.1f}% | "
-            f"orig={rr['acc_original']:.4f} | adv={rr['acc_adversarial']:.4f}"
+            # f"orig={rr['acc_original']:.4f} | adv={rr['acc_adversarial']:.4f}"
+            f"orig={rr['acc_original']:.4f}"
         )
         if "binary_target" in rr:
             msg += (
                 f" | bin(orig)={rr['binary_acc_original']:.4f} "
-                f"| bin(adv)={rr['binary_acc_adversarial']:.4f}"
+                # f"| bin(adv)={rr['binary_acc_adversarial']:.4f}"
             )
         print(msg)
 

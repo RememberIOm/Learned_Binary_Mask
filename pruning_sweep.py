@@ -47,6 +47,7 @@ from learned_binary_mask_pruning import (
     train_with_progressive_pruning,
 )
 from wanda_pruning import wanda_prune
+from mi_pruning import mi_prune
 from decomposition import decompose_to_target_vs_rest  # two-head [target, negative]
 
 
@@ -154,6 +155,47 @@ def run_wanda_once(
         acc_bin, _ = evaluate(
             decomp, test_dl, cfg, device, binary_target_idx=target_class
         )  # requires main.py change
+        row.update({"binary_accuracy": acc_bin, "binary_target_class": target_class})
+
+    return row
+
+
+def run_mi_once(
+    model,
+    calib_dl,
+    test_dl,
+    cfg: ExpConfig,
+    device: torch.device,
+    sparsity: float,
+    target_class: int,
+    apply_decomposition: bool,
+) -> Dict:
+    """
+    Run MI pruning at a given sparsity; return metrics.
+    """
+    # MI pruning uses the calibration dataloader to collect activations.
+    pruned = mi_prune(
+        model,
+        calib_dl,
+        sparsity_ratio=sparsity,
+        device=device,
+    )
+    overall_sparsity, _ = calc_sparsity(pruned)
+    acc_mc, _ = evaluate(pruned, test_dl, cfg, device)
+
+    row = {
+        "method": "mi",
+        "target_sparsity": sparsity,
+        "achieved_sparsity": overall_sparsity / 100.0,
+        "accuracy": acc_mc,
+    }
+
+    if apply_decomposition:
+        # Replace final head with [target, negative] on the PRUNED COPY only
+        decomp = decompose_to_target_vs_rest(pruned, target_class).to(device)
+        acc_bin, _ = evaluate(
+            decomp, test_dl, cfg, device, binary_target_idx=target_class
+        )
         row.update({"binary_accuracy": acc_bin, "binary_target_class": target_class})
 
     return row
@@ -267,6 +309,29 @@ def run_sweep_for_experiment(
             for s in sparsities:
                 cfg.sparsity_ratio = s
                 row = run_wanda_once(
+                    model,
+                    calib_dl,
+                    test_dl,
+                    cfg,
+                    device,
+                    s,
+                    target_class,
+                    apply_decomposition,
+                )
+                row.update(
+                    {
+                        "exp": exp,
+                        "model_name": cfg.model_name,
+                        "dataset": cfg.dataset_name,
+                        "base_accuracy": base_acc,
+                    }
+                )
+                all_rows.append(row)
+        elif method == "mi":
+            # MI pruning is also one-shot per sparsity.
+            for s in sparsities:
+                cfg.sparsity_ratio = s
+                row = run_mi_once(
                     model,
                     calib_dl,
                     test_dl,

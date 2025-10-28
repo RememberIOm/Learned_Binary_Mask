@@ -46,8 +46,25 @@ def _collect_activations(
         layer = model.get_submodule(name)
 
         def hook_fn(module, inp, out, layer_name=name):
-            # Detach and move to CPU to save GPU memory
-            activations[layer_name].append(out.detach().cpu())
+            # Handle tuple outputs from some models (e.g., BertForSequenceClassification)
+            if isinstance(out, tuple):
+                out_tensor = out[0]
+            # Handle ModelOutput objects
+            elif hasattr(out, "last_hidden_state"):
+                out_tensor = out.last_hidden_state
+            else:
+                out_tensor = out
+
+            # Select the [CLS] token representation if sequence data is present (e.g., [B, T, H])
+            if out_tensor.dim() == 3:
+                act = (
+                    out_tensor[:, 0, :].detach().cpu()
+                )  # Take representation of [CLS] token
+            # Otherwise, it's likely a pooled or final layer output (e.g., [B, H])
+            else:
+                act = out_tensor.detach().cpu()
+
+            activations[layer_name].append(act)
 
         hooks.append(layer.register_forward_hook(hook_fn))
 
@@ -61,8 +78,8 @@ def _collect_activations(
     # Concatenate activations from all batches
     for name, acts in activations.items():
         if acts:
-            # Flatten all but the last dimension (features)
-            activations[name] = torch.cat(acts, dim=0).flatten(0, -2)
+            # Concatenate along the batch dimension (dim=0). No flattening needed.
+            activations[name] = torch.cat(acts, dim=0)
         else:
             activations[name] = torch.empty(0)
 
