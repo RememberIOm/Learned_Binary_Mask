@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wanda-decomposition"
+version = "0.1.0"
+description = "Neural network decomposition (target-vs-rest) with Wanda/LBMask/MI pruning and adversarial evaluation"
+requires-python = ">=3.9"
+authors = [{ name = "Junyong Project" }]
+readme = "README.md"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

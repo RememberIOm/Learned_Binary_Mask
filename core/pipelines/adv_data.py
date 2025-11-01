@@ -1,0 +1,109 @@
+# pipelines/adv_data.py
+from __future__ import annotations
+from typing import Optional, Tuple
+import torch
+from torch.utils.data import DataLoader
+
+from core.config import ExpConfig
+from core.data_utils import is_vision
+from core.adversarial.generators import (
+    nlp_to_embeds_dataset,
+    nlp_adv_dataset,
+    vision_adv_dataset,
+    DictSampleDataset,
+)
+from core.adversarial.mixers import make_mixed_loader
+from core.adversarial.adapters import ensure_eps_nlp, ensure_eps_vision
+
+
+def build_mixed_pruning_loader(
+    model,
+    cfg: ExpConfig,
+    base_loader: DataLoader,
+    device: torch.device,
+    adv_ratio: float,
+    *,
+    eps_nlp: dict,
+    eps_vision: dict,
+    vision_stats: Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]] = None,
+) -> DataLoader:
+    """Return a calibration/train loader mixing original and adversarial samples."""
+    if is_vision(cfg):
+        # Build a DictListDataset from the original vision loader (per-sample dicts)
+        items = []
+        for batch in base_loader:
+            px, y = batch["pixel_values"], batch["labels"]
+            for i in range(px.size(0)):
+                items.append({"pixel_values": px[i], "labels": y[i]})
+        base_ds = DictSampleDataset(items)
+        mean, std = vision_stats or (None, None)
+        epsv = ensure_eps_vision(eps_vision)
+        adv_ds = vision_adv_dataset(
+            model,
+            base_loader,
+            device,
+            eps_start_px=epsv.start_px,
+            eps_max_px=epsv.max_px,
+            eps_step_px=epsv.step_px,
+            mean=mean,
+            std=std,
+        )
+    else:
+        base_ds = nlp_to_embeds_dataset(model, base_loader, device)
+        eps_nlp = ensure_eps_nlp(eps_nlp)
+        adv_ds = nlp_adv_dataset(
+            model,
+            base_loader,
+            device,
+            eps_start=eps_nlp.start,
+            eps_max=eps_nlp.max,
+            eps_step=eps_nlp.step,
+        )
+    # Use a small, stable batch size for mixture to improve Wanda/LB-Mask calibration
+    return make_mixed_loader(
+        base_ds=base_ds,
+        adv_ds=adv_ds,
+        adv_ratio=adv_ratio,
+        batch_size=8,
+        shuffle=True,
+    )
+
+
+def build_adversarial_test_loader(
+    model,
+    test_loader: DataLoader,
+    cfg: ExpConfig,
+    device: torch.device,
+    *,
+    eps_nlp: dict,
+    eps_vision: dict,
+    vision_stats: Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]] = None,
+    binary_target_idx: Optional[int] = None,
+) -> DataLoader:
+    """Return a DataLoader consisting only of adversarial samples for robustness eval."""
+    if is_vision(cfg):
+        mean, std = vision_stats or (None, None)
+        epsv = ensure_eps_vision(eps_vision)
+        adv_ds = vision_adv_dataset(
+            model,
+            test_loader,
+            device,
+            eps_start_px=epsv.start_px,
+            eps_max_px=epsv.max_px,
+            eps_step_px=epsv.step_px,
+            mean=mean,
+            std=std,
+            binary_target_idx=binary_target_idx,
+        )
+    else:
+        eps_nlp = ensure_eps_nlp(eps_nlp)
+        adv_ds = nlp_adv_dataset(
+            model,
+            test_loader,
+            device,
+            eps_start=eps_nlp.start,
+            eps_max=eps_nlp.max,
+            eps_step=eps_nlp.step,
+            binary_target_idx=binary_target_idx,
+        )
+    return DataLoader(adv_ds, batch_size=cfg.batch_size, shuffle=False)
